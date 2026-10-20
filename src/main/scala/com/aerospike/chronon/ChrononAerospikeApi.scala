@@ -21,12 +21,32 @@ import ai.chronon.online.{Api, ExternalSourceRegistry, GroupByServingInfoParsed,
 import java.util.function.Consumer
 import scala.util.control.NonFatal
 
+/** Chronon `ai.chronon.online.Api` implementation for Aerospike; the class to
+  * point `api.impl` at. Everything is driven by `userConf` — the same map
+  * Chronon passes to fetchers, the Spark loader, and streaming jobs.
+  *
+  * Provides the shared [[AerospikeKvStore]] plus two pluggable hooks:
+  *
+  *  - `chronon.stream.decoder.class` (required for streaming) — FQN of a
+  *    `StreamDecoder` with a `(GroupByServingInfoParsed)` constructor, loaded
+  *    by reflection.
+  *  - `chronon.log.consumer.class` (optional) — FQN of a
+  *    `java.util.function.Consumer[LoggableResponse]` instantiated once and
+  *    cached; [[logResponse]] is a no-op without it.
+  *
+  * The KV store is `@transient lazy`: deserialized instances rebuild the store
+  * (and its shared client) on first use rather than shipping connections.
+  */
 class ChrononAerospikeApi(userConf: Map[String, String]) extends Api(userConf) {
 
   @transient private lazy val kvStore: KVStore = AerospikeKvStore(userConf)
 
+  /** The singleton [[AerospikeKvStore]] for this `userConf`. */
   override def genKvStore: KVStore = kvStore
 
+  /** Instantiates the `chronon.stream.decoder.class` impl. Throws
+    * `IllegalArgumentException` if the key is absent or the class can't be
+    * constructed (missing class, wrong constructor, init failure). */
   override def streamDecoder(groupByServingInfoParsed: GroupByServingInfoParsed): StreamDecoder = {
     val className = userConf.getOrElse(
       ChrononAerospikeApi.StreamDecoderClassKey,
@@ -35,9 +55,11 @@ class ChrononAerospikeApi(userConf: Map[String, String]) extends Api(userConf) {
     instantiateStreamDecoder(className, groupByServingInfoParsed)
   }
 
+  /** A fresh empty registry; no external sources are registered by default. */
   override def externalRegistry: ExternalSourceRegistry = new ExternalSourceRegistry()
 
-  /** Default no-op; pluggable via `chronon.log.consumer.class` in userConf. */
+  /** No-op unless `chronon.log.consumer.class` is configured, in which case the
+    * response is forwarded to the (cached) consumer instance. */
   override def logResponse(resp: LoggableResponse): Unit = {
     userConf.get(ChrononAerospikeApi.LogConsumerClassKey).foreach { className =>
       logConsumerFor(className).accept(resp)
@@ -76,6 +98,10 @@ class ChrononAerospikeApi(userConf: Map[String, String]) extends Api(userConf) {
 }
 
 object ChrononAerospikeApi {
+  /** `userConf` key: optional `Consumer[LoggableResponse]` FQN for response logging. */
   val LogConsumerClassKey: String = "chronon.log.consumer.class"
+
+  /** `userConf` key: `StreamDecoder` FQN (ctor takes `GroupByServingInfoParsed`);
+    * required by [[ChrononAerospikeApi.streamDecoder]]. */
   val StreamDecoderClassKey: String = "chronon.stream.decoder.class"
 }

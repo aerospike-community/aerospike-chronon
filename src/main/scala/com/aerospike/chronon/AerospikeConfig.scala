@@ -16,6 +16,36 @@
 
 package com.aerospike.chronon
 
+/** Parsed and validated connection/tuning settings for the store, built by
+  * [[AerospikeConfig.fromUserConf]] from Chronon's `userConf` map.
+  *
+  * Only some fields shape the shared client — hosts, port, pool bounds,
+  * `maxCommandsInProcess`, and the three timeouts form
+  * `AerospikeClientHolder`'s cache key; namespace, TTL, key prefix, lookback,
+  * and loader timeout are per-store and never create a second client.
+  *
+  * @param hosts                     cluster seed hosts (required, non-empty)
+  * @param port                      service port (default 3000)
+  * @param namespace                 target namespace (required)
+  * @param ttlSeconds                record TTL for feature records; must be positive
+  *                                  and `<= Int.MaxValue` (default 5 days). Also caps
+  *                                  effective streaming read lookback.
+  * @param maxConnsPerNode           async+sync connection pool cap per node (default 300)
+  * @param minConnsPerNode           pre-opened pool floor per node, `<= maxConnsPerNode`
+  *                                  (default 16; 0 restores lazy growth)
+  * @param connectTimeoutMillis      cluster-tend/seed connect timeout AND
+  *                                  per-policy connect timeout (default 1000)
+  * @param socketTimeoutMillis       per-command socket timeout (default 30000)
+  * @param totalTimeoutMillis        per-command total timeout (default 30000)
+  * @param keyPrefix                 optional prefix prepended to every record key
+  * @param streamingMaxLookbackDays  max day-buckets read per streaming `multiGet`;
+  *                                  must satisfy `days * 86400s <= ttlSeconds`
+  * @param loaderBatchTimeoutSeconds per-chunk `multiPut` await in the Spark loader
+  *                                  (default 60)
+  * @param maxCommandsInProcess      total in-flight async command cap across event
+  *                                  loops; minimum [[AerospikeConfig.MinCommandsInProcess]],
+  *                                  defaults to `maxConnsPerNode` when unset
+  */
 final case class AerospikeConfig(hosts: Seq[String],
                                  port: Int,
                                  namespace: String,
@@ -30,22 +60,40 @@ final case class AerospikeConfig(hosts: Seq[String],
                                  loaderBatchTimeoutSeconds: Int,
                                  maxCommandsInProcess: Option[Int] = None)
 
+/** `userConf` keys (`aerospike.*`), their defaults, and the parser. All
+  * numeric values are parsed strictly — a malformed number throws
+  * `IllegalArgumentException` naming the offending key rather than silently
+  * falling back to a default.
+  */
 object AerospikeConfig {
   val MaxCommandsInProcessKey     = "aerospike.maxCommandsInProcess"
-  /** The client rejects maxCommandsInProcess in 1..4 per event loop. */
+  /** The client rejects `maxCommandsInProcess` in 1..4 per event loop, so the
+    * total cap may not be set below this floor. */
   val MinCommandsInProcess        = 5
 
+  /** Required. Comma-separated seed hosts (e.g. `'host1,host2'`). */
   val HostsKey                    = "aerospike.hosts"
+  /** Service port. Default [[DefaultPort]]. */
   val PortKey                     = "aerospike.port"
+  /** Required. Target namespace. */
   val NamespaceKey                = "aerospike.namespace"
+  /** Record TTL for feature records; also caps streaming lookback. Default [[DefaultTtlSeconds]] (5 days). */
   val TtlSecondsKey               = "aerospike.ttl.seconds"
+  /** Async+sync connection pool cap per node. Default [[DefaultMaxConnsPerNode]]. */
   val MaxConnsPerNodeKey          = "aerospike.maxConnsPerNode"
+  /** Pre-opened pool floor per node, `<= maxConnsPerNode`. Default [[DefaultMinConnsPerNode]]. */
   val MinConnsPerNodeKey          = "aerospike.minConnsPerNode"
+  /** Cluster-tend/seed connect timeout and per-policy connect timeout. Default [[DefaultConnectTimeoutMs]]. */
   val ConnectTimeoutKey           = "aerospike.timeout.connect.millis"
+  /** Per-command socket timeout. Default [[DefaultSocketTimeoutMs]]. */
   val SocketTimeoutKey            = "aerospike.timeout.socket.millis"
+  /** Per-command total timeout. Default [[DefaultTotalTimeoutMs]]. */
   val TotalTimeoutKey             = "aerospike.timeout.total.millis"
+  /** Optional prefix prepended to every record key. */
   val KeyPrefixKey                = "aerospike.key.prefix"
+  /** Max day-buckets read per streaming `multiGet`; must not exceed the TTL. Default [[DefaultStreamingMaxLookbackDays]]. */
   val StreamingMaxLookbackDaysKey = "aerospike.streaming.maxLookbackDays"
+  /** Per-chunk `multiPut` await in the Spark loader. Default [[DefaultLoaderBatchTimeoutSeconds]]. */
   val LoaderBatchTimeoutSecondsKey = "aerospike.loader.batch.timeout.seconds"
 
   val DefaultPort                       = 3000
@@ -62,9 +110,17 @@ object AerospikeConfig {
 
   private val MillisPerDay = 86400000L
 
-  /** Parses `userConf`; missing `aerospike.hosts` must fail fast with a descriptive error.
-    * Numeric parsing errors and consistency violations (max lookback > TTL) include the
-    * offending key name so operators can fix config quickly. */
+  /** Parses `userConf` into a validated [[AerospikeConfig]].
+    *
+    * Required keys: [[HostsKey]] (comma-separated, at least one host) and
+    * [[NamespaceKey]]. Everything else has a `Default*` constant.
+    *
+    * Throws `IllegalArgumentException` on missing required keys, non-numeric or
+    * non-positive numbers, and consistency violations:
+    * `streamingMaxLookbackDays` beyond `ttlSeconds`, `minConnsPerNode >
+    * maxConnsPerNode`, `maxCommandsInProcess < 5`. Every message names the
+    * offending key so operators can fix config quickly.
+    */
   def fromUserConf(userConf: Map[String, String]): AerospikeConfig = {
     val rawHosts = userConf.getOrElse(HostsKey, throw new IllegalArgumentException(
       s"Missing required config key: $HostsKey (e.g. 'localhost' or 'host1,host2')"))

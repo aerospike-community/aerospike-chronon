@@ -54,6 +54,8 @@ class AerospikeDataModelSpec extends AnyFlatSpec with Matchers {
   "dayTs" should "floor a timestamp to start-of-day millis" in {
     dayTs(86400000L + 1234L) shouldBe 86400000L
     dayTs(0L) shouldBe 0L
+    dayTs(-1L) shouldBe -86400000L
+    dayTs(-86400000L) shouldBe -86400000L
   }
 
   "streamingRecordKey" should "append the day bucket derived from tsMillis" in {

@@ -11,6 +11,12 @@ lazy val root = (project in file("."))
   .settings(Defaults.itSettings)
   .settings(
     name := "aerospike-chronon",
+    Compile / doc / scalacOptions ++= Seq(
+      "-doc-title", "aerospike-chronon",
+      "-doc-version", version.value,
+      "-groups",
+      "-implicits"
+    ),
     libraryDependencies ++= Seq(
       chrononApi,
       chrononOnline,

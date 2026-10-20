@@ -31,6 +31,46 @@ import scala.concurrent.{Future, Promise}
 import scala.collection.JavaConverters._
 import scala.util.{Failure, Success}
 
+/** `ai.chronon.online.KVStore` implementation backed by the Aerospike async
+  * Java client.
+  *
+  * == Record layout ==
+  *
+  * Every record holds a single bin `"v"`: an Aerospike map ordered by key, of
+  * `tsMillis -> valueBytes`. Each map entry is one version of the value.
+  *
+  *  - '''Writes''' use `MapOperation.put` against a KEY_ORDERED map policy;
+  *    a write at an existing timestamp overwrites it (last-write-wins), so
+  *    retries are idempotent.
+  *  - '''Reads''' use `MapOperation.getByKeyRange` server-side, so only
+  *    versions with `ts >= afterTsMillis` cross the wire.
+  *  - '''Streaming''' datasets shard one entity into one record per UTC day
+  *    (see [[AerospikeDataModel]]); a `multiGet` fans out into one `BatchRead`
+  *    per day in the lookback window and merges the results.
+  *
+  * == Failure semantics ==
+  *
+  * `multiPut` never fails the batch for a single bad write: per-request results
+  * are booleans in request order (`false` on Aerospike errors, launch
+  * exceptions, or invalid requests such as null key/value bytes or an
+  * over-63-byte set name). `multiGet` returns per-request
+  * `GetResponse(Failure(ex))` on errors but maps `KEY_NOT_FOUND` to an empty
+  * value list rather than a failure.
+  *
+  * == TTL ==
+  *
+  * Records expire after `config.ttlSeconds`, EXCEPT metadata datasets and the
+  * `group_by_serving_info` row in batch sets, which are written with
+  * `expiration = -1` (never expire) so a stalled batch upload degrades to
+  * "stale features" rather than "every fetch throws". The namespace must run
+  * `nsup-period > 0` for expiry to take effect.
+  *
+  * The underlying `AerospikeClient` is shared per JVM via
+  * [[AerospikeClientHolder]]; constructing additional `AerospikeKvStore`
+  * instances with equivalent configs does not open new connections.
+  *
+  * @param config parsed and validated connection/tuning settings
+  */
 class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
 
   import AerospikeDataModel._
@@ -38,21 +78,39 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
 
   private val client = AerospikeClientHolder.clientFor(config)
 
+  /** Single bin holding the `tsMillis -> valueBytes` key-ordered map. */
   private val ValueBin: String = "v"
 
+  /** KEY_ORDERED so server-side `getByKeyRange` on `afterTsMillis` is efficient
+    * and results come back sorted by timestamp. */
   private val KeyOrderedPolicy = new MapPolicy(MapOrder.KEY_ORDERED, MapWriteFlags.DEFAULT)
 
+  /** Lazily-created Chronon metrics context per dataset name. */
   private val metricsByDataset = TrieMap.empty[String, Metrics.Context]
 
-  /** Per-dataset metrics context (latency distributions, success/failure counters). */
+  /** Per-dataset metrics context (latency distributions, success/failure counters),
+    * created on first use under the `GroupByUpload` environment with the dataset
+    * name as suffix. */
   def metricsContextFor(dataset: String): Metrics.Context =
     metricsByDataset.getOrElseUpdate(dataset, Metrics.Context(Metrics.Environment.GroupByUpload).withSuffix(dataset))
 
-  override def create(dataset: String): Unit = {
-    logger.info(s"create($dataset) is a no-op for Aerospike (sets are created on write)")
-    metricsContextFor(dataset).increment("create.successes")
-  }
+  /** No-op: Aerospike sets are created implicitly on first write. */
+  override def create(dataset: String): Unit =
+    logger.debug(s"create($dataset) is a no-op for Aerospike (sets are created on write)")
 
+  /** Asynchronously writes every request; returns per-request success flags in
+    * the same order as `putRequests`.
+    *
+    * Each request becomes one `MapOperation.put` on bin `"v"` keyed by the
+    * request timestamp (or `System.currentTimeMillis()` when absent). Requests
+    * with null `keyBytes`/`valueBytes` or an invalid dataset name resolve to
+    * `false` without touching the cluster.
+    *
+    * Metrics per dataset: `Metrics.Name.WriteLatencyMillis` (batch wall time),
+    * `Metrics.Name.ResponseCount`, `Metrics.Name.RequestCount` (successes),
+    * `write.exceptions` and `write.exceptions.<result_name>`
+    * (per-result-code breakdown, see `AerospikeKvStore.resultName`).
+    */
   override def multiPut(putRequests: Seq[PutRequest]): Future[Seq[Boolean]] = {
     val startNs = System.nanoTime()
     val rejected = Future.successful(Some(WriteFailure(ResultCode.PARAMETER_ERROR, inDoubt = false)))
@@ -80,7 +138,9 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     }
   }
 
-  /** One line per dataset per multiPut so a failure storm cannot flood the log. */
+  /** One summary line per dataset per `multiPut`, so a failure storm cannot
+    * flood the log; groups failures by result code with counts and `inDoubt`
+    * tallies. */
   private def logWriteFailures(dataset: String, failures: Seq[WriteFailure], total: Int): Unit =
     if (failures.nonEmpty) {
       val summary = failures.groupBy(_.resultCode).toSeq.sortBy(-_._2.size).map { case (code, fs) =>
@@ -89,6 +149,11 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
       logger.warn(s"multiPut to $dataset: ${failures.size}/$total writes failed: $summary")
     }
 
+  /** Issues one async map-put. Returns `None` on success or `Some(WriteFailure)`
+    * capturing the Aerospike result code and `inDoubt` flag — both async
+    * listener failures and synchronous launch exceptions are converted to
+    * `Some`, so the returned future never fails. Streaming requests are routed
+    * to their day-bucketed record key. */
   private def putOne(req: PutRequest): Future[Option[WriteFailure]] = {
     val ts = req.tsMillis.getOrElse(System.currentTimeMillis())
     val tableType = getTableType(req.dataset)
@@ -126,6 +191,8 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     promise.future
   }
 
+  /** Validates the physical set name fits Aerospike's 63-byte set-name limit;
+    * returns the error message when it doesn't. */
   private def datasetNameError(dataset: String): Option[String] = {
     val setNameBytes = physicalSetName(dataset).getBytes("UTF-8")
     if (setNameBytes.length > 63) {
@@ -133,11 +200,29 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     } else None
   }
 
+  /** Pre-flight validation for a `GetRequest`: null `keyBytes` or an invalid
+    * dataset name produce a descriptive error used to build a `Failure`
+    * response without hitting the cluster. */
   private def requestError(req: GetRequest): Option[String] = {
     if (req.keyBytes == null) Some("GetRequest.keyBytes is null")
     else datasetNameError(req.dataset)
   }
 
+  /** Batch-reads all requests through one async `client.get`, returning a
+    * `GetResponse` per request in the original order.
+    *
+    * Each valid request expands into one or more `BatchRead`s (one per day
+    * bucket for streaming datasets; exactly one otherwise), each carrying a
+    * server-side map key-range filter honouring `afterTsMillis`. Invalid
+    * requests get an immediate `IllegalArgumentException` failure response.
+    * Per-record `KEY_NOT_FOUND` results become empty `TimedValue` lists; other
+    * per-record errors and whole-batch failures become `Failure`s on the
+    * affected requests.
+    *
+    * Metrics per dataset: `Metrics.Name.LatencyMillis`,
+    * `Metrics.Name.ResponseCount`, `Metrics.Name.RequestCount` (successes),
+    * `Metrics.Name.FetchExceptions`.
+    */
   override def multiGet(requests: Seq[GetRequest]): Future[Seq[GetResponse]] = {
     val startNs = System.nanoTime()
     if (requests.isEmpty) return Future.successful(Nil)
@@ -150,9 +235,7 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
 
     if (goodIndexed.isEmpty) return Future.successful((0 until requests.size).map(badByIndex))
 
-    val goodIndexByRequest = goodIndexed.toMap
-    val goodRequests = goodIndexed.map(_._1)
-    val taggedReads = goodRequests.flatMap(buildBatchReads)
+    val taggedReads = goodIndexed.flatMap { case (req, idx) => buildBatchReads(req).map { case (br, _) => (br, req, idx) } }
     if (taggedReads.isEmpty) return Future.successful(requests.map(r => GetResponse(r, Success(Seq.empty))))
 
     val batchReads = taggedReads.map(_._1).asJava
@@ -177,8 +260,10 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     promise.future
       .map { results =>
         val latencyMs = (System.nanoTime() - startNs) / 1000000
-        val readByRequest = taggedReads.zip(results).groupBy(_._1._2)
-        val goodByIndex = readByRequest.map { case (request, taggedWithResults) =>
+        val readByIndex = taggedReads.zip(results).groupBy(_._1._3)
+        val goodByIndex = readByIndex.map { case (idx, tagged) =>
+          val request = tagged.head._1._2
+          val taggedWithResults = tagged.map { case ((_, _, _), br) => (request, br) }
           val ctx = metricsContextFor(request.dataset)
           ctx.distribution(Metrics.Name.LatencyMillis, latencyMs)
           ctx.increment(Metrics.Name.ResponseCount)
@@ -195,8 +280,6 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
               ctx.increment(Metrics.Name.RequestCount)
               GetResponse(request, Success(values))
           }
-          val idx = goodIndexByRequest.getOrElse(request,
-            throw new IllegalStateException(s"Request $request not found in index"))
           idx -> response
         }.toMap
 
@@ -210,6 +293,13 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
       }
   }
 
+  /** Expands one `GetRequest` into its `BatchRead`s, each tagged back to the
+    * request. Batch/metadata datasets yield a single read; streaming datasets
+    * yield one read per day bucket from `clampedStartDay` through today, where
+    * the start is `afterTsMillis`'s day (the window start when absent) clamped to
+    * `min(ttlSeconds, streamingMaxLookbackDays)` of lookback — expired data is
+    * never read. Each read carries a map key-range op filtering entries with
+    * `ts >= afterTsMillis` (all entries when absent). */
   private def buildBatchReads(req: GetRequest): Seq[(BatchRead, GetRequest)] = {
     val op = req.afterTsMillis match {
       case Some(ts) => MapOperation.getByKeyRange(ValueBin, Value.get(ts), null, MapReturnType.KEY_VALUE)
@@ -220,12 +310,12 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
       case StreamingTable =>
         val now = System.currentTimeMillis()
         val endDay = dayTs(now)
-        val requestedStartDay = req.afterTsMillis.map(dayTs).getOrElse(endDay)
         val effectiveLookbackMillis = math.min(
           config.ttlSeconds * 1000L,
           config.streamingMaxLookbackDays.toLong * MillisPerDay
         )
-        val clampedStartDay = math.max(requestedStartDay, dayTs(now - effectiveLookbackMillis))
+        val lookbackStartDay = dayTs(now - effectiveLookbackMillis)
+        val clampedStartDay = req.afterTsMillis.map(ts => math.max(dayTs(ts), lookbackStartDay)).getOrElse(lookbackStartDay)
         (clampedStartDay to endDay by MillisPerDay).map { day =>
           val recordKeyBytes = streamingRecordKeyFromDay(req.dataset, req.keyBytes, day, config.keyPrefix)
           val key = new Key(config.namespace, physicalSetName(req.dataset), recordKeyBytes)
@@ -238,6 +328,9 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     }
   }
 
+  /** Decodes bin `"v"` map entries into `TimedValue`s. Null/missing records and
+    * bins yield empty; individual malformed entries are skipped with a warning
+    * rather than failing the request. */
   private def extractTimedValues(record: com.aerospike.client.Record): Seq[KVStore.TimedValue] = {
     if (record == null) return Seq.empty
     val raw = record.getList(ValueBin)
@@ -267,6 +360,9 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     }.toSeq
   }
 
+  /** Clones the cached write template and sets per-record expiration:
+    * `expiration = -1` (never expire) for metadata tables and the batch-set
+    * `group_by_serving_info` key; `config.ttlSeconds` otherwise. */
   private def writePolicyFor(dataset: String, keyBytes: Array[Byte]): WritePolicy = {
     val base = new WritePolicy(AerospikeClientHolder.policyTemplates(config).write)
     val tableType = getTableType(dataset)
@@ -279,14 +375,23 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
     base
   }
 
+  /** True when `keyBytes` is Chronon's `group_by_serving_info` key, which must
+    * never expire (see [[writePolicyFor]]). Byte-wise compare — the raw key is
+    * not valid UTF-8 in general. */
   private def isServingInfoKey(keyBytes: Array[Byte]): Boolean =
     Arrays.equals(keyBytes, ApiConstants.GroupByServingInfoKey.getBytes(ApiConstants.UTF8))
 
+  /** Rebuilds an `AerospikeException` from a batch-read result code so
+    * per-record failures surface with the same type callers see from the
+    * client. */
   private def aerospikeException(resultCode: Int, inDoubt: Boolean): AerospikeException = {
     val msg = s"Aerospike error: ${ResultCode.getResultString(resultCode)} (code=$resultCode, inDoubt=$inDoubt)"
     new AerospikeException(resultCode, msg)
   }
 
+  /** Loads one partition of `sourceOfflineTable` into `destinationOnlineDataSet`
+    * via [[Spark2AerospikeLoader.upload]] on the ambient `SparkSession`.
+    * Blocks until the load finishes; throws if any `multiPut` chunk fails. */
   override def bulkPut(sourceOfflineTable: String, destinationOnlineDataSet: String, partition: String): Unit = {
     val spark = org.apache.spark.sql.SparkSession.builder().getOrCreate()
     Spark2AerospikeLoader.upload(spark, sourceOfflineTable, Some(destinationOnlineDataSet), partition, config)
@@ -295,16 +400,23 @@ class AerospikeKvStore(val config: AerospikeConfig) extends KVStore {
 
 object AerospikeKvStore {
 
-  /** Failure detail kept internally; the public `multiPut` contract stays `Seq[Boolean]`. */
+  /** Failure detail kept internally; the public `multiPut` contract stays
+    * `Seq[Boolean]`. `inDoubt` is Aerospike's may-have-applied flag — the write
+    * could have succeeded despite the error (e.g. timeout), which matters
+    * because retries are only safe thanks to last-write-wins idempotency. */
   private[chronon] case class WriteFailure(resultCode: Int, inDoubt: Boolean)
 
-  /** Metric-name-safe label, e.g. -7 -> "no_more_available_connections". The metrics API
-    * has no tags, so the result is encoded in the name; cardinality is bounded by ResultCode. */
+  /** Metric-name-safe label, e.g. -7 -> "no_more_available_connections". The
+    * metrics API has no tags, so the result is encoded in the name; cardinality
+    * is bounded by `ResultCode`. Unknown codes fall back to `code_<n>`. */
   private[chronon] def resultName(code: Int): String = {
     val name = ResultCode.getResultString(code).toLowerCase.replaceAll("[^a-z0-9]+", "_").stripPrefix("_").stripSuffix("_")
     if (name.nonEmpty) name else s"code_${if (code < 0) "neg_" else ""}${math.abs(code)}"
   }
 
+  /** Builds a store from Chronon's `userConf` map; see [[AerospikeConfig]]
+    * for required and optional keys. Throws `IllegalArgumentException` on
+    * missing/invalid config. */
   def apply(userConf: Map[String, String]): AerospikeKvStore =
     new AerospikeKvStore(AerospikeConfig.fromUserConf(userConf))
 }

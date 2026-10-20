@@ -27,12 +27,35 @@ import org.slf4j.{Logger, LoggerFactory}
 import scala.concurrent.Await
 import scala.concurrent.duration.{Duration, SECONDS}
 
+/** Bulk-loads Chronon `_upload` Hive tables into the online store.
+  *
+  * Used two ways: as the `main` CLI entry point (run per group-by after
+  * `metadata-upload`), and by `AerospikeKvStore.bulkPut` for in-app loads.
+  * Both funnel into [[upload]].
+  *
+  * Source tables must expose `key_bytes` and `value_bytes` binary columns and a
+  * `ds` partition column; an optional `ts` column overrides the record version
+  * timestamp, which otherwise defaults to the partition's end-of-day
+  * ([[versionTsMillis]]), matching what the fetcher uses as `batchEndTsMillis`.
+  * Rows missing either binary column are dropped with a warning.
+  *
+  * Writes run inside `foreachPartition`: each executor constructs its own
+  * [[AerospikeKvStore]] (sharing the JVM-wide client via
+  * [[AerospikeClientHolder]]) and drains rows in `ChunkSize` (1000) chunks through
+  * `multiPut`, awaiting each chunk for `loaderBatchTimeoutSeconds`. Any failed
+  * write fails the task — retries rely on last-write-wins idempotency.
+  */
 object Spark2AerospikeLoader {
 
+  /** Rows per `multiPut` call inside an executor. */
   private val ChunkSize = 1000
   private val logger: Logger = LoggerFactory.getLogger(Spark2AerospikeLoader.getClass)
 
-  /** `<gb>_upload` -> `<GB>_BATCH`; `*_daily_stats_upload` -> CHRONON_STATS_BATCH; etc. */
+  /** Infers the online dataset from an upload table name:
+    * `<gb>_upload` -> `<GB>_BATCH`; `*_daily_stats_upload` ->
+    * `CHRONON_STATS_BATCH`; `*_logged_daily_stats_upload` -> the logged-stats
+    * dataset; `*_consistency_upload` -> the consistency-metrics dataset;
+    * anything else -> `<TABLE>_BATCH`. Case-insensitive. */
   def datasetForTable(tableName: String): String = {
     val upper = tableName.toUpperCase
     if (upper.endsWith("_LOGGED_DAILY_STATS_UPLOAD")) {
@@ -49,7 +72,8 @@ object Spark2AerospikeLoader {
     }
   }
 
-  /** `epochMillis(ds) + spanMillis` == fetcher's `batchEndTsMillis`. */
+  /** Version timestamp for a loaded partition: `epochMillis(ds) + spanMillis`
+    * (end of the partition day), matching the fetcher's `batchEndTsMillis`. */
   def versionTsMillis(partitionSpec: PartitionSpec, ds: String): Long =
     partitionSpec.epochMillis(ds) + partitionSpec.spanMillis
 
@@ -99,6 +123,9 @@ object Spark2AerospikeLoader {
     }
   }
 
+  /** Builds a `PutRequest` from a row, or `None` when `key_bytes`/`value_bytes`
+    * are absent or non-binary (dropped by the caller with a warning). `ts` is
+    * taken from a numeric `ts` column when present, else `defaultTs`. */
   private def putRequestFromRow(row: Row,
                                 dataset: String,
                                 hasTs: Boolean,
@@ -118,6 +145,9 @@ object Spark2AerospikeLoader {
     }
   }
 
+  /** Returns the column's bytes, or null when the column is absent from the
+    * schema or not binary — letting the caller distinguish "no column" from
+    * malformed rows. */
   private def safeBytes(row: Row, col: String): Array[Byte] = {
     if (row.schema.fieldNames.contains(col)) {
       row.getAs[Any](col) match {

@@ -28,11 +28,30 @@ import scala.collection.JavaConverters._
 import scala.util.Try
 
 /** One shared Aerospike client per JVM, keyed by config. Lazy; async ops run on
-  * dedicated event loops owned by the client. Policy templates are cached and
-  * cloned so hot paths do not allocate a new policy object per call. */
+  * dedicated `NioEventLoops` owned by the client. Policy templates are cached
+  * and cloned so hot paths do not allocate a new policy object per call.
+  *
+  * The cache key (`clientCacheKey`) covers only the fields that physically
+  * shape the client — hosts, port, connection-pool bounds, in-flight cap, and
+  * timeouts — so two `AerospikeKvStore`s that differ only in namespace, TTL,
+  * key prefix, lookback, or loader timeout share one client and one set of
+  * event loops. In a fetcher JVM this keeps a single connection pool per
+  * cluster regardless of how many stores/datasets are instantiated.
+  *
+  * Each built client registers a shutdown hook closing the client then the
+  * event loops; [[clear]] removes hooks and closes everything, which the
+  * integration suites use so each test talks to its own freshly-started
+  * container.
+  */
 object AerospikeClientHolder {
 
+  /** A constructed client plus the event loops it was built with (closed
+    * together). */
   private case class Holder(client: AerospikeClient, eventLoops: EventLoops)
+
+  /** Cloned-from-client-defaults policies for the two hot paths. Callers that
+    * need per-request mutations (e.g. record TTL) MUST copy the template —
+    * see `AerospikeKvStore.writePolicyFor`. */
   case class PolicyTemplates(write: WritePolicy, batch: BatchPolicy)
 
   private val logger = LoggerFactory.getLogger(getClass)
@@ -52,14 +71,26 @@ object AerospikeClientHolder {
   /** Cache key covering only the fields that affect client and policy construction.
     * Two configs that differ only in namespace, TTL, key prefix, lookback, or loader
     * timeout share one client and event loops. */
-  private def clientCacheKey(config: AerospikeConfig): String =
-    s"${config.hosts.mkString(",")}:${config.port}:${config.maxConnsPerNode}:${config.minConnsPerNode}:" +
+  private[chronon] def clientCacheKey(config: AerospikeConfig): String =
+    s"${config.hosts.sorted.mkString(",")}:${config.port}:${config.maxConnsPerNode}:${config.minConnsPerNode}:" +
       s"${config.maxCommandsInProcess.getOrElse(0)}:" +
       s"${config.connectTimeoutMillis}:${config.socketTimeoutMillis}:${config.totalTimeoutMillis}"
 
-  /** Test/observability hook: how many real clients have been constructed. */
+  /** Test/observability hook: how many real clients have been constructed in
+    * this JVM. Asserts the sharing guarantee — N stores → 1 client. */
   val constructionCount: AtomicInteger = new AtomicInteger(0)
 
+  /** Builds a client + event loops and registers its shutdown hook.
+    *
+    * `maxCommandsInProcess` (defaulting to `maxConnsPerNode`) is the total
+    * in-flight async cap, spread across event loops sized by
+    * [[eventLoopSizing]]; commands beyond the cap queue in the client rather
+    * than failing. A cap above `maxConnsPerNode` only logs a warning — it can
+    * still exhaust the pool under skewed single-node load.
+    *
+    * `ClientPolicy.timeout` is mapped to `connectTimeoutMillis` because it is
+    * the cluster-tend / seed-connection timeout, not a per-transaction timeout
+    * (those live on the policy templates). */
   private def buildHolder(config: AerospikeConfig): Holder = {
     config.maxCommandsInProcess.filter(_ > config.maxConnsPerNode).foreach { v =>
       logger.warn(s"${AerospikeConfig.MaxCommandsInProcessKey}=$v exceeds ${AerospikeConfig.MaxConnsPerNodeKey}=" +
@@ -93,6 +124,8 @@ object AerospikeClientHolder {
     Holder(client, eventLoops)
   }
 
+  /** Returns the shared client for `config`, building it (with event loops and
+    * a shutdown hook) on first use per cache key. Thread-safe and idempotent. */
   def clientFor(config: AerospikeConfig): AerospikeClient =
     clients.computeIfAbsent(clientCacheKey(config), _ => buildHolder(config)).client
 
@@ -118,6 +151,9 @@ object AerospikeClientHolder {
     }
   }
 
+  /** Derives write/batch templates from the client's own defaults (picking up
+    * its timeouts/retry settings) then overrides connect/socket/total timeouts
+    * from `config`. */
   private def buildTemplates(config: AerospikeConfig): PolicyTemplates = {
     val client = clientFor(config)
 

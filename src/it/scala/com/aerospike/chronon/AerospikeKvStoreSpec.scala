@@ -89,6 +89,32 @@ class AerospikeKvStoreSpec extends AnyFlatSpec with Matchers with AerospikeDocke
     values.map(v => new String(v.bytes, UTF_8)) shouldBe Seq("tileA", "tileB", "tileC")
   }
 
+  it should "return the full lookback window for streaming reads without afterTsMillis" in {
+    val store = newStore()
+    val ds = "NOAFTER_GB_STREAMING"
+    val now = System.currentTimeMillis()
+    val day1 = dayTs(now - MillisPerDay)
+    val day2 = dayTs(now)
+    Await.result(store.multiPut(Seq(
+      put(ds, "k", "tileA", day1 + 100L),
+      put(ds, "k", "tileB", day2 + 200L))), timeout)
+    val values = Await.result(store.multiGet(Seq(get(ds, "k"))), timeout).head.values.get
+    values.map(_.millis) shouldBe Seq(day1 + 100L, day2 + 200L)
+  }
+
+  it should "answer duplicate requests in one batch independently" in {
+    val store = newStore()
+    val ds = "DUP_GB_STREAMING"
+    val day = dayTs(System.currentTimeMillis())
+    Await.result(store.multiPut(Seq(put(ds, "k", "t", day + 100L))), timeout)
+    val req = get(ds, "k")
+    val resps = Await.result(store.multiGet(Seq(req, req, get(ds, "other"))), timeout)
+    resps should have size 3
+    resps(0).values.get.map(_.millis) shouldBe Seq(day + 100L)
+    resps(1).values.get.map(_.millis) shouldBe Seq(day + 100L)
+    resps(2).values shouldBe Success(Seq.empty)
+  }
+
   // 3.8 — partial failure + absent key contract
   it should "return false only at the rejected index and never fail the Future" in {
     val store = newStore()
@@ -134,7 +160,7 @@ class AerospikeKvStoreSpec extends AnyFlatSpec with Matchers with AerospikeDocke
 
   // pool exhaustion (NO_MORE_CONNECTIONS, -7) must be absorbed by client-side queueing
   it should "queue a burst larger than the connection pool instead of failing writes" in {
-    val store = newStore(testUserConf + (AerospikeConfig.MaxConnsPerNodeKey -> "8"))
+    val store = newStore(testUserConf + (AerospikeConfig.MaxConnsPerNodeKey -> "8", AerospikeConfig.MinConnsPerNodeKey -> "0"))
     val ds = "BURST_GB_BATCH"
     val burst = (1 to 2000).map(i => put(ds, s"k$i", "v", 100L))
     val results = Await.result(store.multiPut(burst), timeout)
