@@ -1,0 +1,20 @@
+services:
+  aerospike:
+    # Pinned for reproducibility — the env-var config template (NSUP_PERIOD
+    # substitution) is image-version-specific; a mounted aerospike.conf does NOT
+    # work because the entrypoint regenerates it unconditionally.
+    image: aerospike/aerospike-server:8.1.2.5
+    container_name: aerospike-chronon-test
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+    environment:
+      NAMESPACE: test
+      # small nsup period so TTL tests observe expiry quickly
+      NSUP_PERIOD: "2"
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
