@@ -1,0 +1,149 @@
+name: Release
+
+# Builds the library and assembly jars for each Scala version, GPG-signs them, and deploys them
+# to JFrog (connect-maven-dev-local) via aerospike/shared-workflows.
+#
+# Runs in one of two modes, resolved by the `version` job:
+#   release  push of a semantic version tag (vX.Y.Z or vX.Y.Z-suffix). The artifacts carry the tag
+#            version; its X.Y.Z must match ThisBuild / version in build.sbt minus -SNAPSHOT.
+#            Deploys, creates the release bundle, and promotes it to DEV and TEST.
+#   dev      workflow_dispatch on any branch. Deploys as <build.sbt version minus -SNAPSHOT>-dev.
+#            <run number> and creates no release bundle. The dry-run input builds and signs without
+#            uploading.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Build and sign without uploading anything to JFrog
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  attestations: write
+
+jobs:
+  version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is-release: ${{ steps.v.outputs.is-release }}
+      dry-run: ${{ steps.v.outputs.dry-run }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve mode and version
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          DRY_RUN_INPUT: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          project_version="$(sed -nE 's/^ThisBuild \/ version +:= +"([^"]+)".*/\1/p' build.sbt)"
+          if [ -z "$project_version" ]; then
+            echo "::error::could not read ThisBuild / version from build.sbt"
+            exit 1
+          fi
+          base_version="${project_version%-SNAPSHOT}"
+          # Gated on the event rather than the ref: a dispatch can also be started from a tag in
+          # the web UI, and that must stay a dev build.
+          if [ "$EVENT" = "push" ]; then
+            version="${REF_NAME#v}"
+            if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::tag ${REF_NAME} is not a semantic version (vX.Y.Z or vX.Y.Z-suffix)"
+              exit 1
+            fi
+            # Compares X.Y.Z only, so a v0.0.1-rc1 tag releases from 0.0.1-SNAPSHOT as well.
+            if [ "${version%%-*}" != "$base_version" ]; then
+              echo "::error::tag ${REF_NAME} implies version ${version%%-*}, but build.sbt has ${project_version}"
+              exit 1
+            fi
+            is_release=true
+            dry_run=false
+          else
+            # Derived rather than accepted as an input, so a dispatch can never overwrite a release.
+            version="${base_version}-dev.${RUN_NUMBER}"
+            is_release=false
+            dry_run="$DRY_RUN_INPUT"
+          fi
+          {
+            echo "version=$version"
+            echo "is-release=$is_release"
+            echo "dry-run=$dry_run"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved version ${version} (release: ${is_release}, dry run: ${dry_run})"
+
+  artifacts-cicd:
+    needs: version
+    uses: aerospike/shared-workflows/.github/workflows/reusable_artifacts-cicd.yaml@f7d1ce30b376733a51ea05b99f20646d0e248afc # unreleased main after v5.0.0
+    with:
+      gh-workflows-ref: f7d1ce30b376733a51ea05b99f20646d0e248afc # must match the @ref above
+      jf-project: connect
+      jf-build-name: aerospike-chronon
+      version: ${{ needs.version.outputs.version }}
+      build-type: ${{ needs.version.outputs.is-release == 'true' && 'release' || 'dev' }}
+      gh-artifact-directory: dist
+      build-script: bash scripts/build-release-artifacts.sh ${{ needs.version.outputs.version }} dist
+      jar-group-id: com.aerospike
+      matrix-json: >-
+        {"include":[
+          {"runs-on":"ubuntu-22.04","distro":"jvm","arch":"noarch",
+           "setup-java":true,"java-version":"17","java-cache":"sbt"}
+        ]}
+      oidc-provider-name: gh-aerospike
+      oidc-audience: aerospike
+      dry-run: ${{ needs.version.outputs.dry-run == 'true' }}
+    secrets:
+      gpg-private-key: ${{ secrets.GPG_SECRET_KEY }}
+      gpg-public-key: ${{ secrets.GPG_PUBLIC_KEY }}
+      gpg-key-pass: ${{ secrets.GPG_PASS }}
+
+  # A dev build creates no bundle: a promoted bundle locks its dev-local artifacts, and dev
+  # versions are never promoted.
+  create-release-bundle:
+    needs: [version, artifacts-cicd]
+    if: needs.version.outputs.is-release == 'true'
+    uses: aerospike/shared-workflows/.github/workflows/reusable_create-release-bundle.yaml@f7d1ce30b376733a51ea05b99f20646d0e248afc # unreleased main after v5.0.0
+    with:
+      gh-workflows-ref: f7d1ce30b376733a51ea05b99f20646d0e248afc # must match the @ref above
+      jf-project: connect
+      jf-build-names: ${{ needs.artifacts-cicd.outputs.jf-build-name }}:${{ needs.artifacts-cicd.outputs.jf-build-id }}
+      jf-bundle-name: aerospike-chronon
+      version: ${{ needs.version.outputs.version }}
+      jf-bundle-revision: auto
+
+  promote-dev:
+    needs: create-release-bundle
+    uses: aerospike/shared-workflows/.github/workflows/reusable_promote-release-bundle.yaml@f7d1ce30b376733a51ea05b99f20646d0e248afc # unreleased main after v5.0.0
+    with:
+      gh-workflows-ref: f7d1ce30b376733a51ea05b99f20646d0e248afc # must match the @ref above
+      jf-project: connect
+      jf-bundle-name: aerospike-chronon
+      version: ${{ needs.create-release-bundle.outputs.bundle-version }}
+      target-stage: DEV
+
+  promote-test:
+    needs: [create-release-bundle, promote-dev]
+    uses: aerospike/shared-workflows/.github/workflows/reusable_promote-release-bundle.yaml@f7d1ce30b376733a51ea05b99f20646d0e248afc # unreleased main after v5.0.0
+    with:
+      gh-workflows-ref: f7d1ce30b376733a51ea05b99f20646d0e248afc # must match the @ref above
+      jf-project: connect
+      jf-bundle-name: aerospike-chronon
+      version: ${{ needs.create-release-bundle.outputs.bundle-version }}
+      target-stage: TEST
