@@ -547,8 +547,8 @@ Requires JDK 17+ (the `ai.chronon` jars are compiled for Java 17) — run sbt wi
 Chronon, Spark, slf4j and logback left out because the host JVM supplies them:
 
 ```
-target/scala-2.12/aerospike-chronon-assembly-0.1.0-SNAPSHOT.jar   # Scala 2.12
-target/scala-2.13/aerospike-chronon-assembly-0.1.0-SNAPSHOT.jar   # Scala 2.13
+target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar   # Scala 2.12
+target/scala-2.13/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar   # Scala 2.13
 ```
 
 Use the jar whose Scala version matches the Chronon runtime (2.12 for the
@@ -561,7 +561,7 @@ Point Chronon's `run.py` at it:
 
 ```
 python run.py --mode=fetch \
-  --online-jar=target/scala-2.12/aerospike-chronon-assembly-0.1.0-SNAPSHOT.jar \
+  --online-jar=target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar \
   --online-class=com.aerospike.chronon.ChrononAerospikeApi \
   -Zaerospike.hosts=host1,host2 -Zaerospike.namespace=features ...
 ```
@@ -571,7 +571,7 @@ For bulk loads, submit the loader from the same jar:
 ```
 spark-submit --class com.aerospike.chronon.Spark2AerospikeLoader \
   [--conf spark.chronon.partition.column=dt --conf spark.chronon.partition.format=yyyyMMdd] \
-  target/scala-2.12/aerospike-chronon-assembly-0.1.0-SNAPSHOT.jar \
+  target/scala-2.12/aerospike-chronon-assembly-0.0.1-SNAPSHOT.jar \
   --table-name team.my_gb_upload --end-ds 2026-10-13 \
   --aerospike-hosts host1,host2 --namespace features --ttl 432000 [--allow-empty]
 ```
@@ -588,9 +588,34 @@ on the root project; `ThisBuild / scalaVersion` stays 2.12.18).
   `sbt assembly` first for `AssemblyClassLoadingSpec`, which cancels without a
   jar).
 
-There is no CI configuration in this repository; the commands above are what
-a CI matrix should run per Scala version (adding CI is a follow-up, not part
-of this change).
+## Releasing
+
+`.github/workflows/release.yml` publishes to Aerospike's JFrog
+(`connect-maven-dev-local`) through `aerospike/shared-workflows`: it runs
+`scripts/build-release-artifacts.sh <version>`, GPG-signs the output and
+deploys it. Each Scala version publishes two artifacts under `com.aerospike`:
+
+- `aerospike-chronon_<scala>` — the library jar with sources, javadoc and a POM
+  that declares its dependencies.
+- `aerospike-chronon-assembly_<scala>` — the online jar for `--online-jar`,
+  with a POM that declares no dependencies.
+
+The workflow never runs on pull requests or merges; it has two triggers:
+
+`build.sbt` always carries a `-SNAPSHOT` version (for example
+`0.0.1-SNAPSHOT`); published versions are derived from it:
+
+- **Release** — pushing a semantic version tag (`vX.Y.Z` or `vX.Y.Z-suffix`).
+  The artifacts carry the tag's version, and its `X.Y.Z` must match the
+  `build.sbt` version without `-SNAPSHOT` or the run fails, so `v0.0.1` and
+  `v0.0.1-rc1` both release from `0.0.1-SNAPSHOT`. The release also creates the
+  `aerospike-chronon` release bundle and promotes it to DEV and TEST. To
+  release, run `git tag v0.0.1 && git push origin v0.0.1` on the commit to
+  ship, then bump `build.sbt` to the next `-SNAPSHOT`.
+- **Dev build** — Actions → Release → Run workflow, choosing the branch. It
+  publishes `<X.Y.Z>-dev.<run number>` (for example `0.0.1-dev.42`) with no
+  release bundle. Tick **dry-run** to build and sign without uploading
+  anything.
 
 ## License
 
