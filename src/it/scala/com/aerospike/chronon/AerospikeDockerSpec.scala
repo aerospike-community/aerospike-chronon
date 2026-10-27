@@ -34,7 +34,32 @@ trait AerospikeDockerSpec extends BeforeAndAfterAll { this: Suite =>
   }
 
   override def afterAll(): Unit = {
-    Try(Process("docker compose down").!)
+    // stop + rm, not `down`: the rig's network stays up so its deletion cannot
+    // churn other stopped containers' network state (chronon-benchmark-aerospike).
+    val compose = new java.io.File(".").getAbsoluteFile
+    Try(Process("docker compose stop --timeout 1", compose).!)
+    Try(Process("docker compose rm -f", compose).!)
     super.afterAll()
+  }
+
+  val nsup0Port: Int           = 3100
+  val nsup0Container: String   = "aerospike-chronon-test-nosup"
+
+  /** Runs `body` against the profile-gated `nsup0` server (NSUP_PERIOD=0, port
+    * [[nsup0Port]]), removing the container afterwards. Cancels the test when
+    * Docker or the service is unavailable, the same way a missing rig cancels
+    * the other ITs. */
+  def withNsup0Server[T](body: => T): T = {
+    val compose = new java.io.File(".").getAbsoluteFile
+    val up = Try(Process(Seq("docker", "compose", "--profile", "nsup0", "up", "-d", "--wait", "aerospike-nosup"), compose).!)
+    up.foreach { rc =>
+      if (rc != 0) throw new org.scalatest.exceptions.TestCanceledException("docker compose nsup0 up failed", 0)
+    }
+    if (up.isFailure) throw new org.scalatest.exceptions.TestCanceledException(s"docker unavailable: ${up.failed.get.getMessage}", 0)
+    try body
+    finally {
+      Try(Process(s"docker rm -f $nsup0Container").!)
+      AerospikeClientHolder.clear()
+    }
   }
 }

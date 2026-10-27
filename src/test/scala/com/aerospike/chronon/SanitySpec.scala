@@ -9,8 +9,8 @@ class SanitySpec extends AnyFlatSpec with Matchers {
       AerospikeConfig.HostsKey     -> "localhost",
       AerospikeConfig.NamespaceKey -> "test"
     ))
-    conf.ttlSeconds should be > 0L
-    conf.streamingMaxLookbackDays.toLong * 86400000L should be <= conf.ttlSeconds * 1000L
+    conf.batchTtl shouldBe TtlSetting.Seconds(AerospikeConfig.DefaultTtlSeconds.toInt)
+    conf.streamingMaxLookbackDays.toLong * 86400L should be <= AerospikeConfig.DefaultTtlSeconds
   }
 
   "Aerospike Java client" should "be present on the classpath" in {

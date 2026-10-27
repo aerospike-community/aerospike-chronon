@@ -55,6 +55,16 @@ class ChrononAerospikeApiSpec extends AnyFlatSpec with Matchers with AerospikeDo
     ex.getMessage should include("chronon.stream.decoder.class")
   }
 
+  "externalRegistry" should "be shared by the scala and java fetchers" in {
+    val api = new ChrononAerospikeApi(baseConf)
+    api.buildFetcher().externalSourceRegistry should be theSameInstanceAs(api.externalRegistry)
+    val jf = api.buildJavaFetcher()
+    val field = jf.getClass.getDeclaredField("fetcher")
+    field.setAccessible(true)
+    field.get(jf).asInstanceOf[ai.chronon.online.Fetcher].externalSourceRegistry should
+      be theSameInstanceAs(api.externalRegistry)
+  }
+
   "ChrononAerospikeApi" should "survive Java serialization" in {
     val api = new ChrononAerospikeApi(baseConf)
     val bos = new ByteArrayOutputStream()

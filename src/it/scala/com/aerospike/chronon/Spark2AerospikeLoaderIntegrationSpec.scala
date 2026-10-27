@@ -10,7 +10,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import scala.concurrent.Await
 import scala.concurrent.duration._
-import scala.util.Success
+import scala.util.{Success, Try}
 
 /** Integration coverage for the Spark bulk-load path (tasks 5.3, 5.5, 5.5a). */
 class Spark2AerospikeLoaderIntegrationSpec extends AnyFlatSpec with Matchers with AerospikeDockerSpec {
@@ -44,9 +44,9 @@ class Spark2AerospikeLoaderIntegrationSpec extends AnyFlatSpec with Matchers wit
       .saveAsTable(table)
   }
 
-  private def loaderArgs(table: String = table): Array[String] = Array(
+  private def loaderArgs(table: String = table, endDs: String = ds): Array[String] = Array(
     "--table-name", table,
-    "--end-ds", ds,
+    "--end-ds", endDs,
     "--aerospike-hosts", aerospikeHost,
     "--namespace", aerospikeNamespace,
     "--ttl", "86400",
@@ -96,5 +96,60 @@ class Spark2AerospikeLoaderIntegrationSpec extends AnyFlatSpec with Matchers wit
 
     val resp = Await.result(store.multiGet(Seq(GetRequest("user2".getBytes(UTF_8), dataset))), timeout).head
     resp.values.get.map(v => new String(v.bytes, UTF_8)) should contain("ir-bytes-2")
+  }
+
+  // comment 8 — bulkPut applies the loader pool sizing and bulk timeouts
+  it should "pass the forLoader-derived config (loader pool and bulk timeouts) to the upload" in {
+    val conf = testUserConf +
+      ("aerospike.loader.maxConnsPerNode" -> "40") +
+      ("aerospike.loader.minConnsPerNode" -> "2")
+    val store = newStore(conf)
+    var captured: AerospikeConfig = null
+    store.bulkLoadConfigSink = (c: AerospikeConfig) => captured = c
+    // the table need not exist: the sink captures the config before upload runs
+    Try(store.bulkPut("missing_table", dataset, ds))
+    captured should not be null
+    captured.maxConnsPerNode shouldBe 40
+    captured.minConnsPerNode shouldBe 2
+    captured.socketTimeoutMillis shouldBe AerospikeConfig.LoaderSocketTimeoutMs
+    captured.writeTotalTimeoutMillis shouldBe AerospikeConfig.LoaderWriteTotalTimeoutMs
+    captured.readTotalTimeoutMillis shouldBe AerospikeConfig.LoaderReadTotalTimeoutMs
+    captured.maxRetriesWrite shouldBe AerospikeConfig.LoaderMaxRetriesWrite
+    captured.maxRetriesRead shouldBe AerospikeConfig.LoaderMaxRetriesRead
+    captured.maxCommandsInProcess shouldBe None
+  }
+
+  // 13.1 — conf-driven partition spec: yyyyMMdd / dt
+  it should "load a table partitioned by dt in yyyyMMdd with ts at the end of the partition day" in {
+    import spark.implicits._
+    val custom = PartitionSpec(format = "yyyyMMdd", spanMillis = 86400000L)
+    val customTable = "test_upload.my_gb_dt_upload"
+    spark.sql(s"CREATE DATABASE IF NOT EXISTS test_upload")
+    Seq(
+      ("user1", "ir-bytes-1", "20261013"),
+      (ApiConstants.GroupByServingInfoKey, "serving-info-bytes", "20261013")
+    ).toDF("key_str", "value_str", "dt")
+      .selectExpr("CAST(key_str AS BINARY) AS key_bytes",
+                  "CAST(value_str AS BINARY) AS value_bytes",
+                  "dt")
+      .write
+      .mode("overwrite")
+      .saveAsTable(customTable)
+
+    spark.conf.set("spark.chronon.partition.column", "dt")
+    spark.conf.set("spark.chronon.partition.format", "yyyyMMdd")
+    try {
+      Spark2AerospikeLoader.main(loaderArgs(table = customTable, endDs = "20261013"))
+    } finally {
+      spark.conf.set("spark.chronon.partition.column", "ds")
+      spark.conf.set("spark.chronon.partition.format", "yyyy-MM-dd")
+    }
+
+    val store = newStore()
+    val resp = Await.result(store.multiGet(Seq(GetRequest("user1".getBytes(UTF_8), dataset))), timeout).head
+    val values = resp.values.get
+    values should have size 1
+    new String(values.head.bytes, UTF_8) shouldBe "ir-bytes-1"
+    values.head.millis shouldBe custom.epochMillis("20261013") + custom.spanMillis // 2026-10-14T00:00:00Z
   }
 }

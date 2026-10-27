@@ -16,6 +16,8 @@
 
 package com.aerospike.chronon
 
+import ai.chronon.api.{Constants => ApiConstants}
+
 /** Physical layout of Chronon online data in Aerospike.
   *
   * Chronon addresses data by logical `dataset` name; this object maps datasets to
@@ -23,7 +25,7 @@ package com.aerospike.chronon
   *
   * {{{
   *   dataset "*_BATCH"      -> set "GROUPBY_BATCH",     key = [prefix]dataset#keyBytes
-  *   dataset "*_STREAMING"  -> set "GROUPBY_STREAMING", key = [prefix]dataset#keyBytes#dayTs
+  *   dataset "*_STREAMING"  -> set "GROUPBY_STREAMING", key = [prefix]dataset#keyBytes#dayTs#seg
   *   anything else          -> set named by the dataset, key = [prefix]dataset#keyBytes
   * }}}
   *
@@ -55,6 +57,20 @@ object AerospikeDataModel {
   /** Metadata and miscellaneous datasets get their own set named after the dataset. */
   final case class MetadataTable(dataset: String) extends TableType { override def setName: String = dataset }
 
+  /** How a write bounds the version history of its record. */
+  sealed trait Retention
+
+  /** Keep only the newest `n` versions (rank-based, so a late older write trims itself). */
+  final case class KeepVersions(n: Int) extends Retention
+
+  /** Never trim (streaming and the stats timeseries: bounded by TTL, segments and permanence). */
+  case object NoTrim extends Retention
+
+  /** The stats datasets are timeseries read by range; they end in `_BATCH` so
+    * they share a set with group-by IRs but must never be trimmed by rank. */
+  private val StatsDatasets: Set[String] =
+    Set(ApiConstants.StatsBatchDataset, ApiConstants.LogStatsBatchDataset, ApiConstants.ConsistencyMetricsDataset)
+
   /** Byte-level separator between record-key segments (`#`, ASCII 35). */
   val KeySeparator: Byte = '#'.toByte
 
@@ -76,9 +92,52 @@ object AerospikeDataModel {
     */
   def physicalSetName(dataset: String): String = getTableType(dataset).setName
 
+  /** True for any record key inside one of the stats datasets (timeseries or schema key). */
+  def isStatsDataset(dataset: String): Boolean = StatsDatasets.contains(dataset)
+
+  /** Byte-wise check whether `keyBytes` is a stats schema key — ends with
+    * `__keySchema` or `__valueSchema`. Raw comparison like `isServingInfoKey`:
+    * the key is not valid UTF-8 in general. */
+  def isStatsSchemaKey(keyBytes: Array[Byte]): Boolean = {
+    def endsWith(suffix: String): Boolean = {
+      val s = suffix.getBytes(ApiConstants.UTF8)
+      keyBytes.length >= s.length &&
+        java.util.Arrays.equals(
+          java.util.Arrays.copyOfRange(keyBytes, keyBytes.length - s.length, keyBytes.length), s)
+    }
+    endsWith(ApiConstants.TimedKvRDDKeySchemaKey) || endsWith(ApiConstants.TimedKvRDDValueSchemaKey)
+  }
+
+  /** The stats dataset keys holding the join timeseries: any stats key that is
+    * not a schema key. Permanent, segmented and never trimmed. */
+  def isStatsTimeseries(dataset: String, keyBytes: Array[Byte]): Boolean =
+    StatsDatasets.contains(dataset) && !isStatsSchemaKey(keyBytes)
+
+  /** Retention policy for a write. Independent of [[getTableType]], so set names
+    * and record keys are unchanged: stats timeseries keys and streaming ->
+    * [[NoTrim]]; everything else (group-by batch, `group_by_serving_info`,
+    * stats schema keys, metadata) -> [[KeepVersions]]. */
+  def retentionFor(dataset: String, keyBytes: Array[Byte], config: AerospikeConfig): Retention =
+    if (StatsDatasets.contains(dataset)) {
+      if (isStatsSchemaKey(keyBytes)) KeepVersions(config.retainVersions) else NoTrim
+    } else getTableType(dataset) match {
+      case StreamingTable => NoTrim
+      case _              => KeepVersions(config.retainVersions)
+    }
+
+  /** True for keys whose readers only use the newest version, so a read
+    * without `afterTsMillis` can fetch just the top entry server-side: stats
+    * schema keys and every non-stats non-streaming dataset. */
+  def isLatestOnly(dataset: String, keyBytes: Array[Byte]): Boolean =
+    if (StatsDatasets.contains(dataset)) isStatsSchemaKey(keyBytes)
+    else getTableType(dataset) != StreamingTable
+
   /** Start-of-day epoch millis for a version timestamp; the suffix used in
     * streaming day-bucket record keys. */
-  def dayTs(tsMillis: Long): Long = Math.floorDiv(tsMillis, MillisPerDay) * MillisPerDay
+  def dayTs(tsMillis: Long): Long = {
+    val days = Math.floorDiv(tsMillis, MillisPerDay)
+    if (days < Long.MinValue / MillisPerDay) Long.MinValue else days * MillisPerDay
+  }
 
   /** Byte-level key assembly shared by all key builders. Allocation is sized
     * exactly once and filled via `arraycopy` — no intermediate Strings or
@@ -115,8 +174,9 @@ object AerospikeDataModel {
   def recordKey(dataset: String, keyBytes: Array[Byte], keyPrefix: Option[String] = None): Array[Byte] =
     concat(keyPrefix, dataset, keyBytes)
 
-  /** Streaming record key: `[keyPrefix]dataset#keyBytes#dayTs` where the day
-    * bucket is derived from `tsMillis` via [[dayTs]].
+  /** Streaming record key: `[keyPrefix]dataset#keyBytes#dayTs#seg` where the day
+    * bucket is derived from `tsMillis` via [[dayTs]] and `seg` is the segment
+    * index within the day (`0` is the root record).
     *
     * Streaming writes shard one entity into one record per UTC day, so a
     * `multiGet` lookback reads at most `maxLookbackDays` records rather than one
@@ -125,14 +185,38 @@ object AerospikeDataModel {
   def streamingRecordKey(dataset: String,
                          keyBytes: Array[Byte],
                          tsMillis: Long,
-                         keyPrefix: Option[String] = None): Array[Byte] =
-    streamingRecordKeyFromDay(dataset, keyBytes, dayTs(tsMillis), keyPrefix)
+                         keyPrefix: Option[String] = None,
+                         seg: Int = 0): Array[Byte] =
+    streamingRecordKeyFromDay(dataset, keyBytes, dayTs(tsMillis), keyPrefix, seg)
 
   /** Streaming record key using an already-computed start-of-day bucket;
-    * `dayTsValue` must be a [[dayTs]] result (encoded as its decimal string). */
+    * `dayTsValue` must be a [[dayTs]] result (encoded as its decimal string)
+    * and `seg` a non-negative segment index (decimal string, `0` = root). */
   def streamingRecordKeyFromDay(dataset: String,
                                 keyBytes: Array[Byte],
                                 dayTsValue: Long,
-                                keyPrefix: Option[String] = None): Array[Byte] =
-    concat(keyPrefix, dataset, keyBytes, Some(dayTsValue.toString.getBytes("UTF-8")))
+                                keyPrefix: Option[String] = None,
+                                seg: Int = 0): Array[Byte] =
+    concat(keyPrefix, dataset, keyBytes, Some(s"$dayTsValue#$seg".getBytes("UTF-8")))
+
+  /** Stats timeseries day-bucket keys use [[streamingRecordKeyFromDay]]
+    * (`[prefix]dataset#keyBytes#<dayTs>#<seg>`); data written by the earlier
+    * single-record layout stays at [[recordKey]] and is still read. */
+
+  /** First-day marker key: `[keyPrefix]dataset#keyBytes#first`. One
+    * never-expire record per stats join key holding a long bin `first` = the
+    * earliest day bucket with data, so a range read can enumerate days without
+    * scanning back to epoch. */
+  def statsFirstDayKey(dataset: String,
+                       keyBytes: Array[Byte],
+                       keyPrefix: Option[String] = None): Array[Byte] =
+    concat(keyPrefix, dataset, keyBytes, Some("first".getBytes("UTF-8")))
+
+  /** Day buckets a stats timeseries read enumerates: from
+    * `max(dayTs(afterTsMillis), firstDay)` (or `firstDay` when absent) through
+    * `today`, stepping a day; empty when the start is after today. */
+  private[chronon] def statsDays(afterTsMillis: Option[Long], firstDay: Long, today: Long): Seq[Long] = {
+    val start = afterTsMillis.map(ts => math.max(dayTs(ts), firstDay)).getOrElse(firstDay)
+    if (start > today) Seq.empty else start to today by MillisPerDay
+  }
 }

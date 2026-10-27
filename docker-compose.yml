@@ -1,3 +1,11 @@
+name: aerospike-chronon-it
+
+networks:
+  default:
+    # Pinned so the IT rig's lifecycle only ever touches its own resources,
+    # never other Docker projects on the machine.
+    name: aerospike-chronon-it
+
 services:
   aerospike:
     # Pinned for reproducibility — the env-var config template (NSUP_PERIOD
@@ -13,6 +21,24 @@ services:
       NAMESPACE: test
       # small nsup period so TTL tests observe expiry quickly
       NSUP_PERIOD: "2"
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Section 10 (comment 9): a namespace with the supervisor disabled, for the
+  # nsup fail-fast ITs. Profile-gated so `docker compose up` does not start it;
+  # AerospikeDockerSpec.withNsup0Server brings it up for one test and removes it.
+  aerospike-nosup:
+    image: aerospike/aerospike-server:8.1.2.5
+    container_name: aerospike-chronon-test-nosup
+    profiles: ["nsup0"]
+    ports:
+      - "3100:3000"
+    environment:
+      NAMESPACE: test
+      NSUP_PERIOD: "0"
     healthcheck:
       test: ["CMD", "asinfo", "-v", "status"]
       interval: 2s

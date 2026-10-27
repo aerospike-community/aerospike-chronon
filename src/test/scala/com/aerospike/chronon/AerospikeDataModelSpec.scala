@@ -1,5 +1,6 @@
 package com.aerospike.chronon
 
+import ai.chronon.api.{Constants => ApiConstants}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
@@ -23,6 +24,91 @@ class AerospikeDataModelSpec extends AnyFlatSpec with Matchers {
   it should "map any other dataset to a metadata table named by the dataset" in {
     getTableType("ZIPLINE_METADATA") shouldBe MetadataTable("ZIPLINE_METADATA")
     getTableType("ConfByKeyEndPointName") shouldBe MetadataTable("ConfByKeyEndPointName")
+  }
+
+  "retentionFor" should "keep N versions for group-by batch datasets" in {
+    val config = AerospikeConfig.fromUserConf(Map(
+      "aerospike.hosts" -> "h", "aerospike.namespace" -> "n", "aerospike.batch.retainVersions" -> "4"))
+    retentionFor("MY_GB_BATCH", bytes("k"), config) shouldBe KeepVersions(4)
+  }
+
+  it should "never trim the stats timeseries keys in the three stats datasets" in {
+    val config = AerospikeConfig.fromUserConf(Map(
+      "aerospike.hosts" -> "h", "aerospike.namespace" -> "n"))
+    for (ds <- Seq(ApiConstants.StatsBatchDataset, ApiConstants.LogStatsBatchDataset,
+      ApiConstants.ConsistencyMetricsDataset)) {
+      getTableType(ds) shouldBe BatchTable
+      retentionFor(ds, bytes("some-join"), config) shouldBe NoTrim
+      isStatsTimeseries(ds, bytes("some-join")) shouldBe true
+      isLatestOnly(ds, bytes("some-join")) shouldBe false
+    }
+  }
+
+  it should "keep versions and read latest-only for stats schema keys" in {
+    val config = AerospikeConfig.fromUserConf(Map(
+      "aerospike.hosts" -> "h", "aerospike.namespace" -> "n", "aerospike.batch.retainVersions" -> "4"))
+    for (ds <- Seq(ApiConstants.StatsBatchDataset, ApiConstants.LogStatsBatchDataset,
+      ApiConstants.ConsistencyMetricsDataset);
+         suffix <- Seq(ApiConstants.TimedKvRDDKeySchemaKey, ApiConstants.TimedKvRDDValueSchemaKey)) {
+      val key = bytes(s"team/join.v1$suffix")
+      retentionFor(ds, key, config) shouldBe KeepVersions(4)
+      isStatsSchemaKey(key) shouldBe true
+      isStatsTimeseries(ds, key) shouldBe false
+      isLatestOnly(ds, key) shouldBe true
+    }
+    isStatsSchemaKey(bytes("team/join.v1")) shouldBe false
+    isStatsSchemaKey(bytes("__keySchemaExtra")) shouldBe false
+  }
+
+  it should "keep versions for serving-info inside a batch dataset and for other metadata" in {
+    val config = AerospikeConfig.fromUserConf(Map("aerospike.hosts" -> "h", "aerospike.namespace" -> "n"))
+    retentionFor("MY_GB_BATCH", bytes(ApiConstants.GroupByServingInfoKey), config) shouldBe KeepVersions(2)
+    retentionFor("ZIPLINE_METADATA", bytes("conf"), config) shouldBe KeepVersions(2)
+    retentionFor(ApiConstants.GroupByServingInfoKey, bytes("x"), config) shouldBe KeepVersions(2)
+    isLatestOnly("MY_GB_BATCH", bytes(ApiConstants.GroupByServingInfoKey)) shouldBe true
+    isLatestOnly("ZIPLINE_METADATA", bytes("conf")) shouldBe true
+  }
+
+  it should "never trim streaming datasets" in {
+    val config = AerospikeConfig.fromUserConf(Map("aerospike.hosts" -> "h", "aerospike.namespace" -> "n"))
+    retentionFor("MY_GB_STREAMING", bytes("k"), config) shouldBe NoTrim
+    isLatestOnly("MY_GB_STREAMING", bytes("k")) shouldBe false
+  }
+
+  "statsFirstDayKey" should "build DATASET#keyBytes#first" in {
+    statsFirstDayKey("CHRONON_STATS_BATCH", bytes("team/join.v1")) shouldBe
+      bytes("CHRONON_STATS_BATCH#team/join.v1#first")
+    statsFirstDayKey("CHRONON_STATS_BATCH", bytes("k"), Some("ns1:")) shouldBe
+      bytes("ns1:CHRONON_STATS_BATCH#k#first")
+  }
+
+  it should "preserve binary key bytes verbatim (no UTF-8 round-trip)" in {
+    val k = Array[Byte](0xFF.toByte, 0x01)
+    statsFirstDayKey("CHRONON_STATS_BATCH", k) shouldBe
+      ("CHRONON_STATS_BATCH#".getBytes(UTF_8) ++ k ++ "#first".getBytes(UTF_8))
+  }
+
+  it should "no longer provide statsSegmentKey" in {
+    AerospikeDataModel.getClass.getDeclaredMethods.map(_.getName) should not contain "statsSegmentKey"
+  }
+
+  "stats day keys" should "use the streaming record key layout" in {
+    streamingRecordKeyFromDay("CHRONON_STATS_BATCH", bytes("team/join.v1"), 86400000L) shouldBe
+      bytes("CHRONON_STATS_BATCH#team/join.v1#86400000#0")
+    streamingRecordKeyFromDay("CHRONON_STATS_BATCH", bytes("team/join.v1"), 86400000L, seg = 3) shouldBe
+      bytes("CHRONON_STATS_BATCH#team/join.v1#86400000#3")
+  }
+
+  "statsDays" should "enumerate from max(dayTs(afterTs), firstDay) through today" in {
+    val today = dayTs(System.currentTimeMillis())
+    val first = today - 10 * MillisPerDay
+    statsDays(Some(today - 3 * MillisPerDay + 1234L), first, today) shouldBe
+      (today - 3 * MillisPerDay to today by MillisPerDay)
+    statsDays(Some(0L), first, today) shouldBe (first to today by MillisPerDay)
+    statsDays(Some(today - 20 * MillisPerDay), first, today) shouldBe (first to today by MillisPerDay)
+    statsDays(None, first, today) shouldBe (first to today by MillisPerDay)
+    statsDays(Some(today + MillisPerDay), first, today) shouldBe empty
+    statsDays(None, today, today) shouldBe Seq(today)
   }
 
   "physicalSetName" should "return GROUPBY_BATCH / GROUPBY_STREAMING for groupBy datasets" in {
@@ -58,19 +144,42 @@ class AerospikeDataModelSpec extends AnyFlatSpec with Matchers {
     dayTs(-86400000L) shouldBe -86400000L
   }
 
+  it should "not overflow at the extremes" in {
+    dayTs(2 * MillisPerDay) shouldBe 2 * MillisPerDay
+    dayTs(-2 * MillisPerDay - 1) shouldBe -3 * MillisPerDay
+    val maxDay = dayTs(Long.MaxValue)
+    maxDay should be <= Long.MaxValue
+    maxDay % MillisPerDay shouldBe 0L
+    dayTs(Long.MaxValue - 1) shouldBe maxDay
+    dayTs(Long.MinValue) shouldBe Long.MinValue
+    dayTs(Long.MinValue + 1) shouldBe Long.MinValue
+  }
+
   "streamingRecordKey" should "append the day bucket derived from tsMillis" in {
     val ts = 86400000L + 999L // second day
-    streamingRecordKey("MY_GB_STREAMING", bytes("k"), ts) shouldBe bytes("MY_GB_STREAMING#k#86400000")
+    streamingRecordKey("MY_GB_STREAMING", bytes("k"), ts) shouldBe bytes("MY_GB_STREAMING#k#86400000#0")
   }
 
   it should "prepend the configured key prefix" in {
-    streamingRecordKey("MY_GB_STREAMING", bytes("k"), 1L, Some("ns1:")) shouldBe bytes("ns1:MY_GB_STREAMING#k#0")
+    streamingRecordKey("MY_GB_STREAMING", bytes("k"), 1L, Some("ns1:")) shouldBe bytes("ns1:MY_GB_STREAMING#k#0#0")
+  }
+
+  "streaming keys" should "carry a segment marker on every key, with the root at #0" in {
+    streamingRecordKey("MY_GB_STREAMING", bytes("k"), 5L) shouldBe bytes("MY_GB_STREAMING#k#0#0")
+    streamingRecordKey("MY_GB_STREAMING", bytes("k"), 5L, seg = 3) shouldBe bytes("MY_GB_STREAMING#k#0#3")
+    streamingRecordKeyFromDay("MY_GB_STREAMING", bytes("k"), 86400000L, seg = 12) shouldBe
+      bytes("MY_GB_STREAMING#k#86400000#12")
+  }
+
+  it should "leave batch and metadata keys unchanged" in {
+    recordKey("MY_GB_BATCH", bytes("k")) shouldBe bytes("MY_GB_BATCH#k")
+    recordKey("ZIPLINE_METADATA", bytes("k")) shouldBe bytes("ZIPLINE_METADATA#k")
   }
 
   "streamingRecordKeyFromDay" should "use the supplied day bucket directly" in {
     streamingRecordKeyFromDay("MY_GB_STREAMING", bytes("k"), 86400000L) shouldBe
-      bytes("MY_GB_STREAMING#k#86400000")
+      bytes("MY_GB_STREAMING#k#86400000#0")
     streamingRecordKeyFromDay("MY_GB_STREAMING", bytes("k"), 86400000L, Some("ns1:")) shouldBe
-      bytes("ns1:MY_GB_STREAMING#k#86400000")
+      bytes("ns1:MY_GB_STREAMING#k#86400000#0")
   }
 }

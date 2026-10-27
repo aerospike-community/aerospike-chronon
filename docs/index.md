@@ -3,7 +3,9 @@
 An `ai.chronon.online.KVStore` implementation backed by the Aerospike async Java
 client, plus the `Api` wiring and a Spark bulk loader. This page is the map;
 the [generated Scaladoc](#generating-the-api-docs) is the reference, and the
-[README](../README.md) remains the operations/config guide.
+[README](../README.md) remains the operations/config guide (including the
+packaging/run-through-Chronon instructions for the `sbt assembly` online jar
+and the 2.12/2.13 cross-build).
 
 ## Architecture
 
@@ -47,8 +49,9 @@ one map entry per version.
 
 | Dataset suffix | Aerospike set | Record key | TTL |
 |---|---|---|---|
-| `*_BATCH` | `GROUPBY_BATCH` | `[prefix]dataset#keyBytes` | `ttlSeconds` (never-expire for `group_by_serving_info`) |
-| `*_STREAMING` | `GROUPBY_STREAMING` | `[prefix]dataset#keyBytes#dayTs` (one record per entity per UTC day) | `ttlSeconds` |
+| `*_BATCH` | `GROUPBY_BATCH` | `[prefix]dataset#keyBytes` | `ttlSeconds` (never-expire for `group_by_serving_info` and stats keys) |
+| stats timeseries | `GROUPBY_BATCH` | `[prefix]dataset#keyBytes#dayTs#seg` (one chain per join per UTC day, `tail` on each day root) + marker `[prefix]dataset#keyBytes#first` + legacy plain key (read-only) | never expire |
+| `*_STREAMING` | `GROUPBY_STREAMING` | `[prefix]dataset#keyBytes#dayTs#seg` (one chain per entity per UTC day, `tail` on root) | `ttlSeconds` |
 | anything else | the dataset name | `[prefix]dataset#keyBytes` | never expire |
 
 ## File guide

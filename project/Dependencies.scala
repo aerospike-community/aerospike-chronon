@@ -12,9 +12,4 @@ object Dependencies {
   lazy val slf4j            = "org.slf4j"      % "slf4j-api"             % "1.7.36"
   lazy val scalatest        = "org.scalatest" %% "scalatest"            % "3.2.17"
 
-  // benchmark-module-only dependencies
-  lazy val mongoScalaDriver = "org.mongodb.scala" %% "mongo-scala-driver" % "4.11.2"
-  lazy val hdrHistogram     = "org.hdrhistogram"   % "HdrHistogram"       % "2.1.12"
-  lazy val upickle          = "com.lihaoyi"        %% "upickle"           % "3.1.4"
-  lazy val openpdf          = "com.github.librepdf" % "openpdf"           % "1.3.30"
 }
