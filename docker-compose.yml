@@ -13,10 +13,19 @@ services:
     # work because the entrypoint regenerates it unconditionally.
     image: aerospike/aerospike-server:8.1.2.5
     container_name: aerospike-chronon-test
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "3000:3000"
-      - "3001:3001"
-      - "3002:3002"
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:3002:3002"
     environment:
       NAMESPACE: test
       # small nsup period so TTL tests observe expiry quickly
@@ -34,8 +43,17 @@ services:
     image: aerospike/aerospike-server:8.1.2.5
     container_name: aerospike-chronon-test-nosup
     profiles: ["nsup0"]
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "3100:3000"
+      - "127.0.0.1:3100:3000"
     environment:
       NAMESPACE: test
       NSUP_PERIOD: "0"
