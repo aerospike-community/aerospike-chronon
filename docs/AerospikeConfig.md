@@ -101,3 +101,62 @@ defaults 32 / 0) instead.
 
 ### Review
 No significant issues identified.
+
+## TLS and authentication keys
+
+TLS is opt-in and requires Enterprise Edition. `aerospike.tls.enabled` must be
+`true` before any other `aerospike.tls.*` key is accepted — a stray TLS key on
+a plaintext config fails at parse rather than silently flipping the wire.
+When TLS is enabled every connection (seed, tend, async commands) is TLS; the
+async path uses netty event loops (the direct-NIO loops cannot speak TLS), so
+netty 4.2 is bundled and **shaded** into the assembly jar
+(`chronon.shaded.io.netty.*`, along with `chronon.shaded.com.aerospike.client.*`),
+so TLS works out of the box even on hosts carrying netty 4.1 (Spark 3.5).
+Consumers of the thin `packageBin` jar instead get `io.netty` as a normal POM
+dependency and must have netty 4.2+ on their own classpath. Two cosmetic notes:
+stack traces name the shaded classes, and JVM shutdown can log a harmless
+`ClassNotFoundException` for a shaded inner class (the shutdown-hook thread's
+context classloader cannot see them).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `aerospike.tls.enabled` | unset | `true`/`false`; required before any `aerospike.tls.*` key |
+| `aerospike.tls.name` | unset | Cluster-wide TLS name for seeds without `host:tlsName[:port]` (seed name wins; NOT mapped to `clusterName`, which also enables cluster-name validation) |
+| `aerospike.tls.protocols` | client default (TLSv1.2) | Comma-separated protocol allowlist |
+| `aerospike.tls.ciphers` | JVM ciphers | Comma-separated cipher allowlist |
+| `aerospike.tls.truststore.file` | unset | JKS/PKCS12 CA truststore; absent = default JVM `SSLContext` (system truststore / `-Djavax.net.ssl.trustStore`) |
+| `aerospike.tls.truststore.password.file` | unset | File containing the truststore password |
+| `aerospike.tls.truststore.type` | `JKS` | `JKS` or `PKCS12` |
+| `aerospike.tls.keystore.file` | unset | JKS/PKCS12 keystore with client cert chain + key (mTLS / PKI) |
+| `aerospike.tls.keystore.password.file` | required with keystore | File containing the keystore password |
+| `aerospike.tls.keystore.key.password.file` | keystore password | File containing the key password |
+| `aerospike.tls.keystore.type` | `JKS` | `JKS` or `PKCS12` |
+| `aerospike.tls.forLoginOnly` | `false` | TLS for login only — credentials over TLS, then CLEARTEXT data plane; requires credentials. Not transport encryption |
+| `aerospike.user` | unset | Auth user |
+| `aerospike.password.file` | unset | File containing the password, read on the JVM that builds the client (each Spark executor needs it) |
+| `aerospike.password.env` | unset | NAME of an environment variable holding the password, read on the JVM that builds the client (each Spark executor needs it in its own env) |
+| ~~`aerospike.password`~~ | removed | Inline passwords were serialised into Spark task closures and visible in logs; setting the key fails at parse naming the two keys above |
+| `aerospike.auth.mode` | `internal` | `internal` \| `external` \| `external_insecure` \| `pki` |
+
+Seeds accept the client's native `host[:tlsName][:port]` form;
+`aerospike.port` is now the default for seeds that omit a port (backward
+compatible).
+
+### Validation (all fail at `fromUserConf`, naming the keys)
+
+- Any `aerospike.tls.*` key while `tls.enabled` is absent/false; a `host:tlsName` seed with TLS off.
+- Keystore without `keystore.password.file`; orphaned truststore/keystore password files.
+- `user` XOR password source; `password.file` and `password.env` together; the removed inline `password` key.
+- `auth.mode=external`: requires TLS + credentials. `external_insecure`: credentials only (testing). `pki`: TLS + keystore, and forbids user/password (the cert CN is the user; provisioned server-side as a `nopassword` user).
+- `forLoginOnly`: requires TLS + credentials.
+- `clientCacheKey` covers TLS and auth identity (stores incl. their password-file paths, protocols, ciphers, `forLoginOnly`, auth mode, user, password file path / env var name) — a TLS config can never inherit a plaintext client, and a store pointing at a *different password source* gets its own client (a wrong source fails at connect instead of silently reusing a working client). An env var cannot change inside a JVM, so keying on its name is exact; a password file rewritten at an unchanged path reuses the existing client (restart to rotate).
+- Credentials are **references, never values**: the file/env is read at client build on the JVM that builds the client (a Spark executor reads *its own* file/env), so no secret is in `userConf`, the serialised `AerospikeConfig` or Spark task closures. An unset or blank env var fails closed (`IllegalStateException` naming the variable) rather than building an unauthenticated client.
+- On Spark, give executors the variable via cluster-level env/secret mounts, or `spark.executorEnv.<NAME>` (Spark's default `spark.redaction.regex` redacts config names containing "password"; name the variable accordingly if you use it).
+
+### Test fixture
+
+`docker/gen-tls-certs.sh` generates throwaway certs + Java stores
+(`docker/tls-certs/`). The `tls` compose profile brings up EE 8.2.0.1 services
+on 4533 (server auth) and 4534 (mTLS required); `AerospikeDockerSpec.withTlsServers`
+manages them and provisions `chronon-user`/`chronon-pass` plus the
+`chronon-client` PKI user.

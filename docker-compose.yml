@@ -62,3 +62,57 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # Opt-in TLS fixtures: Enterprise Edition eval image (single-node feature
+  # key baked in). TLS requires EE, so these stay profile-gated — CE users
+  # never start them. Run `docker/gen-tls-certs.sh` once first; the ITs do so
+  # automatically. Tested image: aerospike/aerospike-server-enterprise:8.2.0.1
+  # (override with AEROSPIKE_TLS_IMAGE).
+  aerospike-tls:
+    image: ${AEROSPIKE_TLS_IMAGE:-aerospike/aerospike-server-enterprise:8.2.0.1}
+    container_name: aerospike-chronon-test-tls
+    profiles: ["tls"]
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:4533:4333"
+    volumes:
+      - ./docker/aerospike-tls.conf:/etc/aerospike/aerospike.template.conf:ro
+      - ./docker/tls-certs:/opt/aerospike/certs:ro
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status", "-Uadmin", "-Padmin"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Same fixture with tls-authenticate-client any — mTLS-required tests.
+  aerospike-tls-mtls:
+    image: ${AEROSPIKE_TLS_IMAGE:-aerospike/aerospike-server-enterprise:8.2.0.1}
+    container_name: aerospike-chronon-test-tls-mtls
+    profiles: ["tls"]
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:4534:4333"
+    volumes:
+      - ./docker/aerospike-tls-mtls.conf:/etc/aerospike/aerospike.template.conf:ro
+      - ./docker/tls-certs:/opt/aerospike/certs:ro
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status", "-Uadmin", "-Padmin"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
